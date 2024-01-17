@@ -43,6 +43,10 @@ describe("RestoreNode", function()
 			exec_lua("return " .. snip .. ":get_static_text()"),
 			{ "aaaa" }
 		)
+		assert.are.same(
+			exec_lua("return " .. snip .. ":get_docstring()"),
+			{ "${1:${${1:aaaa}}}$0" }
+		)
 		exec_lua("ls.snip_expand(" .. snip .. ")")
 
 		screen:expect({
@@ -50,6 +54,13 @@ describe("RestoreNode", function()
 			^a{3:aaa}                                              |
 			{0:~                                                 }|
 			{2:-- SELECT --}                                      |]],
+		})
+
+		-- can use get_docstring on inactive restoreNode.
+		assert.are.same(exec_lua("return ls.get_current_choices()"), {
+			[[${${1:aaaa}}]],
+			[[${"${${1:aaaa}}"}]],
+			[[${'${${1:aaaa}}'}]],
 		})
 
 		feed("bbbb")
@@ -95,6 +106,12 @@ describe("RestoreNode", function()
 			{ "a -> a aaaa" }
 		)
 		exec_lua("ls.snip_expand(" .. snip .. ")")
+
+		-- next jump to "aaaa"-insertNode.
+		assert.are.same(
+			exec_lua([[return ls.jump_destination(1).absolute_insert_position]]),
+			{ 2, 0, 1, 0, 1 }
+		)
 
 		screen:expect({
 			grid = [[
@@ -144,6 +161,10 @@ describe("RestoreNode", function()
 			{ "aca" }
 		)
 		exec_lua("ls.snip_expand(" .. snip .. ")")
+		assert.are.same(
+			exec_lua([[return ls.jump_destination(1).absolute_insert_position]]),
+			{ 1, 1, 2, 0, 1, 1 }
+		)
 
 		screen:expect({
 			grid = [[
@@ -299,9 +320,15 @@ describe("RestoreNode", function()
 		ls_helpers.static_docstring_test(
 			snip,
 			{ "aaaaaa" },
-			{ "${1:${1:${1:aaa}${2:${1:aaa}}}}$0" }
+			{ "${1:${${1:aaa}${2:${1:aaa}}}}$0" }
 		)
 		exec_lua("ls.snip_expand(" .. snip .. ")")
+
+		assert.are.same(
+			exec_lua([[return ls.jump_destination(1).absolute_insert_position]]),
+			{ 1, 1, 0, 2, 0, 1 }
+		)
+
 		screen:expect({
 			grid = [[
 			^a{3:aa}aaa                                            |

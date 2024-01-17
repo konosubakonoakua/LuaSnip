@@ -29,13 +29,17 @@ describe("snippetProxy", function()
 		".wordTrig",
 		".regTrig",
 		".dscr",
+		".description",
+		".filetype",
 		".name",
 		".callbacks",
-		".condition",
+		".resolveExpandParams",
 		".show_condition",
 		".stored",
+		".priority",
 		':matches("asd")',
 		":get_docstring()",
+		":retrieve_all()",
 	}) do
 		no_inst_on_access_test(v)
 	end

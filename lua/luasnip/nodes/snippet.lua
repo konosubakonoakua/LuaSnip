@@ -12,10 +12,40 @@ local session = require("luasnip.session")
 local pattern_tokenizer = require("luasnip.util.pattern_tokenizer")
 local dict = require("luasnip.util.dict")
 local snippet_collection = require("luasnip.session.snippet_collection")
+local extend_decorator = require("luasnip.util.extend_decorator")
+local source = require("luasnip.session.snippet_collection.source")
+local loader_util = require("luasnip.loaders.util")
+local trig_engines = require("luasnip.nodes.util.trig_engines")
 
 local true_func = function()
 	return true
 end
+
+local generate_resolve_expand_params_func = function(condition, user_resolve)
+	return function(self, line_to_cursor, match, captures)
+		if condition then
+			if not condition(line_to_cursor, match, captures) then
+				return nil
+			end
+		end
+
+		local default_expand_params = {
+			trigger = match,
+			captures = captures,
+		}
+
+		if user_resolve then
+			local res = user_resolve(self, line_to_cursor, match, captures)
+			if res == nil then
+				return nil
+			end
+			return vim.tbl_extend("force", default_expand_params, res)
+		else
+			return default_expand_params
+		end
+	end
+end
+
 local callbacks_mt = {
 	__index = function(table, key)
 		rawset(table, key, {})
@@ -124,11 +154,8 @@ end
 local function init_snippetNode_opts(opts)
 	local in_node = {}
 
-	opts = opts or {}
-
-	in_node.child_ext_opts = ext_util.child_complete(
-		vim.deepcopy(opts.child_ext_opts or {})
-	)
+	in_node.child_ext_opts =
+		ext_util.child_complete(vim.deepcopy(opts.child_ext_opts or {}))
 
 	if opts.merge_child_ext_opts == nil then
 		in_node.merge_child_ext_opts = true
@@ -146,12 +173,6 @@ end
 local function init_snippet_opts(opts)
 	local in_node = {}
 
-	opts = opts or {}
-
-	in_node.condition = opts.condition or true_func
-
-	in_node.show_condition = opts.show_condition or true_func
-
 	-- return sn(t("")) for so-far-undefined keys.
 	in_node.stored = setmetatable(opts.stored or {}, stored_mt)
 
@@ -160,59 +181,104 @@ local function init_snippet_opts(opts)
 		in_node.stored[key] = wrap_nodes_in_snippetNode(nodes)
 	end
 
-	-- init invalidated here.
-	-- This is because invalidated is a key that can be populated without any
-	-- information on the actual snippet (it can be used by snippetProxy!).
-	in_node.invalidated = false
-
 	return vim.tbl_extend("error", in_node, init_snippetNode_opts(opts))
 end
 
-local function init_snippet_context(context)
-	if type(context) == "string" then
-		context = { trig = context }
-	end
+-- context, opts non-nil tables.
+local function init_snippet_context(context, opts)
+	local effective_context = {}
 
 	-- trig is set by user, trigger is used internally.
-	-- maybe breaking change, but not worth it, probably.
-	context.trigger = context.trig
-	context.trig = nil
+	-- not worth a breaking change, we just make it compatible here.
+	effective_context.trigger = context.trig
 
-	context.name = context.name or context.trigger
+	effective_context.name = context.name or context.trig
 
-	-- context.dscr could be nil, string or table.
-	context.dscr = util.to_line_table(
-		util.wrap_value(context.dscr or context.trigger)
+	-- context.{desc,dscr} could be nil, string or table.
+	-- (defaults to trigger)
+	effective_context.description =
+		util.to_line_table(context.desc or context.dscr or context.trig)
+	-- (keep dscr to avoid breaking downstream usages)
+	effective_context.dscr = effective_context.description
+
+	-- might be nil, but whitelisted in snippetProxy.
+	effective_context.priority = context.priority
+
+	-- might be nil, but whitelisted in snippetProxy.
+	-- shall be a string, allowed values: "snippet", "autosnippet"
+	-- stylua: ignore
+	assert(
+		   context.snippetType == nil
+		or context.snippetType == "snippet"
+		or context.snippetType == "autosnippet",
+		"snippetType has to be either 'snippet' or 'autosnippet' (or unset)"
 	)
+	-- switch to plural forms so that we can use this for indexing
+	-- stylua: ignore
+	effective_context.snippetType =
+		   context.snippetType == "autosnippet" and "autosnippets"
+		or context.snippetType == "snippet"     and "snippets"
+		or nil
 
-	-- -1 for no prio, we cannot use nil because accessing a nil-value in a
-	-- snippetProxy will cause instantiation.
-	context.priority = context.priority or -1
+	-- may be nil.
+	effective_context.filetype = context.filetype
 
 	-- maybe do this in a better way when we have more parameters, but this is
-	-- fine for now.
+	-- fine for now:
 
 	-- not a necessary argument.
-	if context.docstring then
-		context.docstring = util.to_line_table(context.docstring)
+	if context.docstring ~= nil then
+		effective_context.docstring = util.to_line_table(context.docstring)
 	end
 
-	-- default: true.
-	if context.wordTrig == nil then
-		context.wordTrig = true
-	end
+	-- can't use `cond and ... or ...` since we have truthy values.
+	effective_context.wordTrig =
+		util.ternary(context.wordTrig ~= nil, context.wordTrig, true)
+	effective_context.hidden =
+		util.ternary(context.hidden ~= nil, context.hidden, false)
 
-	-- default: false.
-	if context.hidden == nil then
-		context.hidden = false
-	end
+	effective_context.regTrig =
+		util.ternary(context.regTrig ~= nil, context.regTrig, false)
 
-	-- default: false.
-	if context.regTrig == nil then
-		context.regTrig = false
+	effective_context.docTrig = context.docTrig
+	local engine
+	if type(context.trigEngine) == "function" then
+		-- if trigEngine is function, just use that.
+		engine = context.trigEngine
+	else
+		-- otherwise, it is nil or string, if it is string, that is the name,
+		-- otherwise use "pattern" if regTrig is set, and finally fall back to
+		-- "plain" if it is not.
+		local engine_name = util.ternary(
+			context.trigEngine ~= nil,
+			context.trigEngine,
+			util.ternary(context.regTrig ~= nil, "pattern", "plain")
+		)
+		engine = trig_engines[engine_name]
 	end
+	-- make sure to pass through nil-trigEngineOpts, they will be recognized and
+	-- we will get a default-version of that function instead of generating a
+	-- curried (?) version of it (which would waste space I think).
+	effective_context.trig_matcher =
+		engine(effective_context.trigger, context.trigEngineOpts)
 
-	return context
+	effective_context.resolveExpandParams = generate_resolve_expand_params_func(
+		context.condition or opts.condition,
+		context.resolveExpandParams
+	)
+	effective_context.show_condition = context.show_condition
+		or opts.show_condition
+		or true_func
+
+	-- init invalidated here.
+	-- This is because invalidated is a key that can be populated without any
+	-- information on the actual snippet (it can be used by snippetProxy!) and
+	-- it should be also available to the snippet-representations in the
+	-- snippet-list, and not in the expanded snippet, as doing this in
+	-- `init_snippet_opts` would suggest.
+	effective_context.invalidated = false
+
+	return effective_context
 end
 
 -- Create snippet without initializing opts+context.
@@ -230,7 +296,65 @@ local function _S(snip, nodes, opts)
 			dependents = {},
 			active = false,
 			type = types.snippet,
+			-- dependents_dict is responsible for associating
+			-- function/dynamicNodes ("dependents") with their argnodes.
+			-- There are a few important requirements that have to be
+			-- fulfilled:
+			-- Allow associating present dependent with non-present argnode
+			-- (and vice-versa).
+			-- This is required, because a node outside some dynamicNode
+			-- could depend on a node inside it, and since the content of a
+			-- dynamicNode changes, it is possible that the argnode will be
+			-- generated.
+			-- As soon as that happens, it should be possible to immediately
+			-- find the dependents that depend on the newly-generated argnode,
+			-- without searching the snippet.
+			--
+			-- The dependents_dict enables all of this by storing every node
+			-- which is addressable by either `absolute_indexer` or
+			-- `key_indexer` (or even directly, just with its own
+			-- table, ie. `self`) under its path.
+			-- * `absolute_indexer`: the path is the sequence of jump_indices
+			-- which leads to this node, for example {1,3,1}.
+			-- * `key_indexer`: the path is {"key", <the_key>}.
+			-- * `node`: the path is {node}.
+			-- With each type of node-reference (absolute_indexer, key, node),
+			-- the node which is referenced by it, is stored under path ..
+			-- {"node"} (if it exists inside the current snippet!!), while the
+			-- dependents are stored at path .. {"dependents"}.
+			-- The manner in which the dependents are stored is also
+			-- interesting:
+			-- They are not stored in eg a list, since we would then have to
+			-- deal with explicitly invalidating them (remove them from the
+			-- list to prevent its growing too large). No, the dependents are
+			-- stored under their own absolute position (not absolute _insert_
+			-- position, functionNodes don't have a jump-index, and thus can't
+			-- be addressed using absolute insert position), which means that
+			--
+			-- a) once a dependent is re-generated, for example by a
+			-- dynamicNode, it will not take up new space, but simply overwrite
+			-- the old one (which is very desirable!!)
+			-- b) we will still store some older, unnecessary dependents
+			--
+			-- (imo) a outweighs b, which is why this design was chosen.
+			-- (non-visible nodes are ignored by tracking their visibility in
+			-- the snippet separately, it is then queried in eg.
+			-- `update_dependents`)
+			--
+			-- Related functions:
+			-- * `dependent:set_dependents` to insert argnode+dependent in
+			--   `dependents_dict`, in the according to the above description.
+			-- * `set_argnodes` to insert the absolute_insert_position ..
+			--   {"node"} into dependents_dict.
+			-- * `get_args` to get the text of the argnodes to some dependent
+			--   node.
+			-- * `update_dependents` can be called to find all dependents, and
+			--   update the visible ones.
 			dependents_dict = dict.new(),
+
+			-- list of snippets expanded within the region of this snippet.
+			-- sorted by their buffer-position, for quick searching.
+			child_snippets = {},
 		}),
 		opts
 	)
@@ -238,8 +362,14 @@ local function _S(snip, nodes, opts)
 	-- is propagated to all subsnippets, used to quickly find the outer snippet
 	snip.snippet = snip
 
-	-- the snippet may not have dependents.
-	snip._update_dependents = function() end
+	-- if the snippet is expanded inside another snippet (can be recognized by
+	-- non-nil parent_node), the node of the snippet this one is inside has to
+	-- update its dependents.
+	function snip:_update_dependents()
+		if self.parent_node then
+			self.parent_node:update_dependents()
+		end
+	end
 	snip.update_dependents = snip._update_dependents
 
 	snip:init_nodes()
@@ -258,13 +388,30 @@ local function _S(snip, nodes, opts)
 end
 
 local function S(context, nodes, opts)
-	local snip = init_snippet_context(context)
+	opts = opts or {}
+
+	local snip = init_snippet_context(node_util.wrap_context(context), opts)
 	snip = vim.tbl_extend("error", snip, init_snippet_opts(opts))
 
-	return _S(snip, nodes, opts)
+	snip = _S(snip, nodes, opts)
+
+	if __luasnip_get_loaded_file_frame_debuginfo ~= nil then
+		-- this snippet is being lua-loaded, and the source should be recorded.
+		snip._source =
+			source.from_debuginfo(__luasnip_get_loaded_file_frame_debuginfo())
+	end
+
+	return snip
 end
+extend_decorator.register(
+	S,
+	{ arg_indx = 1, extend = node_util.snippet_extend_context },
+	{ arg_indx = 3 }
+)
 
 function SN(pos, nodes, opts)
+	opts = opts or {}
+
 	local snip = Snippet:new(
 		vim.tbl_extend("error", {
 			pos = pos,
@@ -282,6 +429,7 @@ function SN(pos, nodes, opts)
 
 	return snip
 end
+extend_decorator.register(SN, { arg_indx = 3 })
 
 local function ISN(pos, nodes, indent_text, opts)
 	local snip = SN(pos, nodes, opts)
@@ -325,106 +473,245 @@ local function ISN(pos, nodes, indent_text, opts)
 
 	return snip
 end
+extend_decorator.register(ISN, { arg_indx = 4 })
 
 function Snippet:remove_from_jumplist()
+	if not self.visible then
+		-- snippet not visible => already removed.
+		-- Don't remove it twice.
+		return
+	end
+
 	-- prev is i(-1)(startNode), prev of that is the outer/previous snippet.
+	-- pre is $0 or insertNode.
 	local pre = self.prev.prev
 	-- similar for next, self.next is the i(0).
+	-- nxt is snippet.
 	local nxt = self.next.next
 
 	self:exit()
 
-	-- basically four possibilities: only snippet, between two snippets,
-	-- inside an insertNode (start), inside an insertNode (end).
+	local sibling_list = self.parent_node ~= nil
+			and self.parent_node.parent.snippet.child_snippets
+		or session.snippet_roots[vim.api.nvim_get_current_buf()]
+	local self_indx
+	for i, snip in ipairs(sibling_list) do
+		if snip == self then
+			self_indx = i
+		end
+	end
+	table.remove(sibling_list, self_indx)
+
+	-- previous snippet jumps to this one => redirect to jump to next one.
 	if pre then
-		-- Snippet is linearly behind previous snip, the appropriate value
-		-- for nxt.prev is set later.
-		if pre.pos == 0 then
-			pre.next = nxt
-		else
-			if nxt ~= pre then
-				-- if not the only snippet inside the insertNode:
-				pre.inner_first = nxt
-				nxt.prev = pre
-				return
-			else
+		if pre.inner_first == self then
+			if pre == nxt then
 				pre.inner_first = nil
-				pre.inner_last = nil
-				pre.inner_active = false
-				return
+			else
+				pre.inner_first = nxt
 			end
+		elseif pre.next == self then
+			pre.next = nxt
 		end
 	end
 	if nxt then
-		if nxt.pos == -1 then
-			nxt.prev = pre
-		else
-			-- only possible if this is the last inside an insertNode, only
-			-- snippet in insertNode is handled above
-			nxt.inner_last = pre
-			pre.next = nxt
+		if nxt.inner_last == self.next then
+			if pre == nxt then
+				nxt.inner_last = nil
+			else
+				nxt.inner_last = pre
+			end
+		-- careful here!! nxt.prev is its start_node, nxt.prev.prev is this
+		-- snippet.
+		elseif nxt.prev.prev == self.next then
+			nxt.prev.prev = pre
 		end
 	end
 end
 
-local function insert_into_jumplist(snippet, start_node, current_node)
-	if current_node then
-		-- currently at the endpoint (i(0)) of another snippet, this snippet
-		-- is inserted _behind_ that snippet.
-		if current_node.pos == 0 then
-			if current_node.next then
-				if current_node.next.pos == -1 then
-					-- next is beginning of another snippet, this snippet is
-					-- inserted before that one.
-					current_node.next.prev = snippet.insert_nodes[0]
-				else
-					-- next is outer insertNode.
-					current_node.next.inner_last = snippet.insert_nodes[0]
+local function insert_into_jumplist(
+	snippet,
+	start_node,
+	current_node,
+	parent_node,
+	sibling_snippets,
+	own_indx
+)
+	local prev_snippet = sibling_snippets[own_indx - 1]
+	-- have not yet inserted self!!
+	local next_snippet = sibling_snippets[own_indx]
+
+	-- only consider sibling-snippets with the same parent-node as
+	-- previous/next snippet for linking-purposes.
+	-- They are siblings because they are expanded in the same snippet, not
+	-- because they have the same parent_node.
+	local prev, next
+	if prev_snippet ~= nil and prev_snippet.parent_node == parent_node then
+		prev = prev_snippet
+	end
+	if next_snippet ~= nil and next_snippet.parent_node == parent_node then
+		next = next_snippet
+	end
+
+	-- whether roots should be linked together.
+	local link_roots = session.config.link_roots
+
+	-- whether children of the same snippet should be linked to their parent
+	-- and eachother.
+	local link_children = session.config.link_children
+
+	if parent_node then
+		if node_util.linkable_node(parent_node) then
+			-- snippetNode (which has to be empty to be viable here) and
+			-- insertNode can both deal with inserting a snippet inside them
+			-- (ie. hooking it up st. it can be visited after jumping back to
+			-- the snippet of parent).
+			-- in all cases
+			if link_children and prev ~= nil then
+				-- if we have a previous snippet we can link to, just do that.
+				prev.next.next = snippet
+				start_node.prev = prev.insert_nodes[0]
+			else
+				-- only jump from parent to child if link_children is set.
+				if link_children then
+					-- prev is nil, but we can link up using the parent.
+					parent_node.inner_first = snippet
 				end
+				-- make sure we can jump back to the parent.
+				start_node.prev = parent_node
 			end
-			snippet.insert_nodes[0].next = current_node.next
-			current_node.next = start_node
-			start_node.prev = current_node
-		elseif current_node.pos == -1 then
-			if current_node.prev then
-				if current_node.prev.pos == 0 then
-					current_node.prev.next = start_node
-				else
-					current_node.prev.inner_first = snippet
+
+			-- exact same reasoning here as in prev-case above, omitting comments.
+			if link_children and next ~= nil then
+				-- jump from next snippets start_node to $0.
+				next.prev.prev = snippet.insert_nodes[0]
+				-- jump from $0 to next snippet (skip its start_node)
+				snippet.insert_nodes[0].next = next
+			else
+				if link_children then
+					parent_node.inner_last = snippet.insert_nodes[0]
 				end
+				snippet.insert_nodes[0].next = parent_node
 			end
-			snippet.insert_nodes[0].next = current_node
-			start_node.prev = current_node.prev
-			current_node.prev = snippet.insert_nodes[0]
 		else
-			snippet.insert_nodes[0].next = current_node
-			-- jump into snippet directly.
-			current_node.inner_first = snippet
-			current_node.inner_last = snippet.insert_nodes[0]
+			-- naively, even if the parent is linkable, there might be snippets
+			-- before/after that share the same parent, so we could
+			-- theoretically link up with them.
+			-- This, however, can cause cyclic jumps, for example if the
+			-- previous child-snippet contains the current node: we will jump
+			-- from the end of the new snippet into the previous child-snippet,
+			-- and from its last node into the new snippet.
+			-- Since cycles should be avoided (very weird if the jumps just go
+			-- in a circle), we have no choice but to fall back to this
+			-- old-style linkage.
+
+			-- Don't jump from current_node to this snippet (I feel
+			-- like that should be good: one can still get back to ones
+			-- previous history, and we don't mess up whatever jumps
+			-- are set up around current_node)
 			start_node.prev = current_node
+			snippet.insert_nodes[0].next = current_node
+		end
+	-- don't link different root-nodes for unlinked_roots.
+	elseif link_roots then
+		-- inserted into top-level snippet-forest, just hook up with prev, next.
+		-- prev and next have to be snippets or nil, in this case.
+		if prev ~= nil then
+			prev.next.next = snippet
+			start_node.prev = prev.insert_nodes[0]
+		end
+		if next ~= nil then
+			snippet.insert_nodes[0].next = next
+			next.prev.prev = snippet.insert_nodes[0]
 		end
 	end
 
-	-- snippet is between i(-1)(startNode) and i(0).
-	snippet.next = snippet.insert_nodes[0]
-	snippet.prev = start_node
-
-	snippet.insert_nodes[0].prev = snippet
-	start_node.next = snippet
+	table.insert(sibling_snippets, own_indx, snippet)
 end
 
-function Snippet:trigger_expand(current_node, pos_id, env)
+function Snippet:trigger_expand(current_node, pos_id, env, indent_nodes)
 	local pos = vim.api.nvim_buf_get_extmark_by_id(0, session.ns_id, pos_id, {})
-	self:event(events.pre_expand, { expand_pos = pos })
+
+	-- find tree-node the snippet should be inserted at (could be before another node).
+	local _, sibling_snippets, own_indx, parent_node =
+		node_util.snippettree_find_undamaged_node(pos, {
+			tree_respect_rgravs = false,
+			tree_preference = node_util.binarysearch_preference.outside,
+			snippet_mode = "linkable",
+		})
+	local n_siblings_pre = #sibling_snippets
+
+	if current_node then
+		if parent_node then
+			if node_util.linkable_node(parent_node) then
+				node_util.refocus(current_node, parent_node)
+				parent_node:input_enter_children()
+			else
+				-- enter extmarks of parent_node, but don't enter it
+				-- "logically", it will not be the parent of the snippet.
+				parent_node:focus()
+				-- enter current node, it will contain the new snippet.
+				current_node:input_enter_children()
+			end
+		else
+			-- if no parent_node, completely leave.
+			node_util.refocus(current_node, nil)
+
+			-- in this branch, it may happen that the snippet we leave is
+			-- invalid and removed from the snippet-list during `refocus`.
+			-- This is not catastrophic, but we have to recognize it here, and
+			-- update the `own_indx` among the snippet-roots (one was deleted,
+			-- the computed index is no longer valid since there may have been
+			-- a shift down over `own_indx`)
+			if n_siblings_pre ~= #sibling_snippets then
+				-- only own_indx can change, since the text in the buffer is
+				-- unchanged, while the number of roots is.
+				_, _, own_indx, _ =
+					node_util.snippettree_find_undamaged_node(pos, {
+						tree_respect_rgravs = false,
+						tree_preference = node_util.binarysearch_preference.outside,
+						snippet_mode = "linkable",
+					})
+			end
+		end
+
+		-- There may be other snippets inside of this parent_node/on this level
+		-- of the snippet-tree whose extmarks have to be adjusted s.t. they
+		-- don't contain the text that will be inserted during put_initial.
+		-- Node's/snippet's extmarks that are outside of this parent_node/not
+		-- siblings of this node will be adjusted during the refocus above, if
+		-- applicable.
+		--
+		-- The following adjustments may do too much, but there's no issue
+		-- with that, and we're on the safe side.
+
+		-- set rgrav false for snippets/nodes where the right boundary
+		-- coincides with the position we insert at now...
+		for i = 1, own_indx - 1 do
+			sibling_snippets[i]:subtree_set_pos_rgrav(pos, -1, false)
+		end
+		-- set rgrav true for snippets/nodes where the left boundary
+		-- coincides with the position we insert at now...
+		for i = own_indx, #sibling_snippets do
+			sibling_snippets[i]:subtree_set_pos_rgrav(pos, 1, true)
+		end
+	end
+
+	local pre_expand_res = self:event(events.pre_expand, { expand_pos = pos })
+		or {}
 	-- update pos, event-callback might have moved the extmark.
 	pos = vim.api.nvim_buf_get_extmark_by_id(0, session.ns_id, pos_id, {})
 
-	local indentstring = util.line_chars_before(pos):match("^%s*")
-	-- expand tabs before indenting to keep indentstring unmodified
-	if vim.bo.expandtab then
-		self:expand_tabs(util.tab_width(), #indentstring)
+	Environ:override(env, pre_expand_res.env_override or {})
+
+	if indent_nodes then
+		local indentstring = util.line_chars_before(pos):match("^%s*")
+		-- expand tabs before indenting to keep indentstring unmodified
+		if vim.bo.expandtab then
+			self:expand_tabs(util.tab_width(), #indentstring)
+		end
+		self:indent(indentstring)
 	end
-	self:indent(indentstring)
 
 	-- (possibly) keep user-set opts.
 	if self.merge_child_ext_opts then
@@ -438,9 +725,9 @@ function Snippet:trigger_expand(current_node, pos_id, env)
 
 	local parent_ext_base_prio
 	-- if inside another snippet, increase priority accordingly.
-	-- for now do a check for .indx.
-	if current_node and (current_node.indx and current_node.indx > 1) then
-		parent_ext_base_prio = current_node.parent.ext_opts.base_prio
+	-- parent_node is only set if this snippet is expanded inside another one.
+	if parent_node then
+		parent_ext_base_prio = parent_node.parent.ext_opts.base_prio
 	else
 		parent_ext_base_prio = session.config.ext_base_prio
 	end
@@ -473,11 +760,10 @@ function Snippet:trigger_expand(current_node, pos_id, env)
 	local old_pos = vim.deepcopy(pos)
 	self:put_initial(pos)
 
-	-- update() may insert text, set marks appropriately.
 	local mark_opts = vim.tbl_extend("keep", {
 		right_gravity = false,
-		end_right_gravity = true,
-	}, self.ext_opts.passive)
+		end_right_gravity = false,
+	}, self:get_passive_ext_opts())
 	self.mark = mark(old_pos, pos, mark_opts)
 
 	self:update()
@@ -486,46 +772,51 @@ function Snippet:trigger_expand(current_node, pos_id, env)
 	-- Marks should stay at the beginning of the snippet, only the first mark is needed.
 	start_node.mark = self.nodes[1].mark
 	start_node.pos = -1
+	-- needed for querying node-path from snippet to this node.
+	start_node.absolute_position = { -1 }
 	start_node.parent = self
 
-	insert_into_jumplist(self, start_node, current_node)
+	-- hook up i0 and start_node, and then the snippet itself.
+	-- they are outside, not inside the snippet.
+	-- This should clearly be the case for start_node, but also for $0 since
+	-- jumping to $0 should make/mark the snippet non-active (for example via
+	-- extmarks)
+	start_node.next = self
+	self.prev = start_node
+	self.insert_nodes[0].prev = self
+	self.next = self.insert_nodes[0]
+
+	-- parent_node is nil if the snippet is toplevel.
+	self.parent_node = parent_node
+
+	insert_into_jumplist(
+		self,
+		start_node,
+		current_node,
+		parent_node,
+		sibling_snippets,
+		own_indx
+	)
+
+	return parent_node
 end
 
 -- returns copy of snip if it matches, nil if not.
 function Snippet:matches(line_to_cursor)
-	local from
-	local match
-	local captures = {}
-	if self.regTrig then
-		-- capture entire trigger, must be put into match.
-		local find_res = { string.find(line_to_cursor, self.trigger .. "$") }
-		if #find_res > 0 then
-			from = find_res[1]
-			match = line_to_cursor:sub(from, #line_to_cursor)
-			for i = 3, #find_res do
-				captures[i - 2] = find_res[i]
-			end
-		end
-	else
-		if
-			line_to_cursor:sub(
-				#line_to_cursor - #self.trigger + 1,
-				#line_to_cursor
-			) == self.trigger
-		then
-			from = #line_to_cursor - #self.trigger + 1
-			match = self.trigger
-		end
-	end
+	local match, captures = self.trig_matcher(line_to_cursor, self.trigger)
 
 	-- Trigger or regex didn't match.
 	if not match then
 		return nil
 	end
 
-	if not self.condition(line_to_cursor, match, captures) then
+	local expand_params =
+		self:resolveExpandParams(line_to_cursor, match, captures)
+	if not expand_params then
 		return nil
 	end
+
+	local from = #line_to_cursor - #match + 1
 
 	-- if wordTrig is set, the char before the trigger can't be \w or the
 	-- word has to start at the beginning of the line.
@@ -543,44 +834,7 @@ function Snippet:matches(line_to_cursor)
 		return nil
 	end
 
-	return { trigger = match, captures = captures }
-end
-
-function Snippet:enter_node(node_id)
-	if self.parent then
-		self.parent:enter_node(self.indx)
-	end
-
-	for i = 1, node_id - 1 do
-		self.nodes[i]:set_mark_rgrav(false, false)
-	end
-
-	local node = self.nodes[node_id]
-	node:set_mark_rgrav(
-		node.ext_gravities_active[1],
-		node.ext_gravities_active[2]
-	)
-
-	local _, node_to = node.mark:pos_begin_end_raw()
-	local i = node_id + 1
-	while i <= #self.nodes do
-		local other = self.nodes[i]
-		local other_from, other_to = other.mark:pos_begin_end_raw()
-
-		local end_equal = util.pos_equal(other_to, node_to)
-		other:set_mark_rgrav(util.pos_equal(other_from, node_to), end_equal)
-		i = i + 1
-
-		-- As soon as one end-mark wasn't equal, we no longer have to check as the
-		-- marks don't overlap.
-		if not end_equal then
-			break
-		end
-	end
-	while i <= #self.nodes do
-		self.nodes[i]:set_mark_rgrav(false, false)
-		i = i + 1
-	end
+	return expand_params
 end
 
 -- https://gist.github.com/tylerneylon/81333721109155b2d244
@@ -607,44 +861,17 @@ function Snippet:copy()
 	return copy3(self)
 end
 
-function Snippet:set_text(node, text)
-	local node_from, node_to = node.mark:pos_begin_end_raw()
-
-	self:enter_node(node.indx)
-	local ok = pcall(
-		vim.api.nvim_buf_set_text,
-		0,
-		node_from[1],
-		node_from[2],
-		node_to[1],
-		node_to[2],
-		text
-	)
-	-- we can assume that (part of) the snippet was deleted; remove it from
-	-- the jumplist.
-	if not ok then
-		error("[LuaSnip Failed]: " .. vim.inspect(text))
-	end
-end
-
 function Snippet:del_marks()
 	for _, node in ipairs(self.nodes) do
 		vim.api.nvim_buf_del_extmark(0, session.ns_id, node.mark.id)
 	end
 end
 
-function Snippet:is_interactive()
+function Snippet:is_interactive(info)
 	for _, node in ipairs(self.nodes) do
 		-- return true if any node depends on another node or is an insertNode.
-		if
-			node.type == types.insertNode
-			or ((node.type == types.functionNode or node.type == types.dynamicNode) and #node.args ~= 0)
-			or node.type == types.choiceNode
-		then
+		if node:is_interactive(info) then
 			return true
-			-- node is snippet, recurse.
-		elseif node.type == types.snippetNode then
-			return node:is_interactive()
 		end
 	end
 	return false
@@ -671,7 +898,7 @@ function Snippet:put_initial(pos)
 		local mark_opts = vim.tbl_extend("keep", {
 			right_gravity = false,
 			end_right_gravity = false,
-		}, node.ext_opts.passive)
+		}, node:get_passive_ext_opts())
 		node.mark = mark(old_pos, pos, mark_opts)
 	end
 	self.visible = true
@@ -688,12 +915,7 @@ function Snippet:fake_expand(opts)
 	if opts.env then
 		self.env = opts.env
 	else
-		self.env = {}
-		setmetatable(self.env, {
-			__index = function(_, key)
-				return Environ.is_table(key) and { "$" .. key } or "$" .. key
-			end,
-		})
+		self.env = Environ.fake()
 	end
 
 	self.captures = {}
@@ -703,10 +925,10 @@ function Snippet:fake_expand(opts)
 		end,
 	})
 	if self.docTrig then
-		-- This fills captures[1] with docTrig if no capture groups are defined
-		-- and therefore slightly differs from normal expansion where it won't
-		-- be filled, but that's alright.
-		self.captures = { self.docTrig:match(self.trigger) }
+		-- use docTrig as entire line up to cursor, this assumes that it
+		-- actually matches the trigger.
+		local _
+		_, self.captures = self.trig_matcher(self.docTrig, self.trigger)
 		self.trigger = self.docTrig
 	else
 		self.trigger = "$TRIGGER"
@@ -857,11 +1079,17 @@ function Snippet:make_args_absolute()
 	end
 end
 
-function Snippet:input_enter()
+function Snippet:input_enter(_, dry_run)
+	if dry_run then
+		dry_run.active[self] = true
+		return
+	end
+
+	self.visited = true
 	self.active = true
 
 	if self.type == types.snippet then
-		-- set snippet-passive -> passive for all children.
+		-- set snippet-passive -> visited/unvisited for all children.
 		self:set_ext_opts("passive")
 	end
 	self.mark:update_opts(self.ext_opts.active)
@@ -869,7 +1097,12 @@ function Snippet:input_enter()
 	self:event(events.enter)
 end
 
-function Snippet:input_leave()
+function Snippet:input_leave(_, dry_run)
+	if dry_run then
+		dry_run.active[self] = false
+		return
+	end
+
 	self:event(events.leave)
 	self:update_dependents()
 
@@ -889,20 +1122,25 @@ function Snippet:set_ext_opts(opt_name)
 	end
 end
 
-function Snippet:jump_into(dir, no_move)
-	if self.active then
-		self:input_leave()
+function Snippet:jump_into(dir, no_move, dry_run)
+	self:init_dry_run_active(dry_run)
+
+	-- if dry_run, ignore self.active
+	if self:is_active(dry_run) then
+		self:input_leave(no_move, dry_run)
+
 		if dir == 1 then
-			return self.next:jump_into(dir, no_move)
+			return self.next:jump_into(dir, no_move, dry_run)
 		else
-			return self.prev:jump_into(dir, no_move)
+			return self.prev:jump_into(dir, no_move, dry_run)
 		end
 	else
-		self:input_enter()
+		self:input_enter(no_move, dry_run)
+
 		if dir == 1 then
-			return self.inner_first:jump_into(dir, no_move)
+			return self.inner_first:jump_into(dir, no_move, dry_run)
 		else
-			return self.inner_last:jump_into(dir, no_move)
+			return self.inner_last:jump_into(dir, no_move, dry_run)
 		end
 	end
 end
@@ -911,100 +1149,21 @@ end
 -- used in LSP-Placeholders.
 
 function Snippet:exit()
+	if self.type == types.snippet then
+		-- if exit is called, this will not be visited again.
+		-- Thus, also clean up the child-snippets, which will also not be
+		-- visited again, since they can only be visited through self.
+		for _, child in ipairs(self.child_snippets) do
+			child:exit()
+		end
+	end
+
 	self.visible = false
 	for _, node in ipairs(self.nodes) do
 		node:exit()
 	end
 	self.mark:clear()
 	self.active = false
-end
-
-function Snippet:set_mark_rgrav(val_begin, val_end)
-	-- set own markers.
-	node_mod.Node.set_mark_rgrav(self, val_begin, val_end)
-
-	local snip_pos_begin, snip_pos_end = self.mark:pos_begin_end_raw()
-
-	if
-		snip_pos_begin[1] == snip_pos_end[1]
-		and snip_pos_begin[2] == snip_pos_end[2]
-	then
-		for _, node in ipairs(self.nodes) do
-			node:set_mark_rgrav(val_begin, val_end)
-		end
-		return
-	end
-
-	local node_indx = 1
-	-- the first node starts at begin-mark.
-	local node_on_begin_mark = true
-
-	-- only change gravities on nodes that absolutely have to.
-	while node_on_begin_mark do
-		-- will be set later if the next node has to be updated as well.
-		node_on_begin_mark = false
-		local node = self.nodes[node_indx]
-		if not node then
-			break
-		end
-		local node_pos_begin, node_pos_end = node.mark:pos_begin_end_raw()
-		-- use false, false as default, this is what most nodes will be set to.
-		local new_rgrav_begin, new_rgrav_end =
-			node.mark.opts.right_gravity, node.mark.opts.end_right_gravity
-		if
-			node_pos_begin[1] == snip_pos_begin[1]
-			and node_pos_begin[2] == snip_pos_begin[2]
-		then
-			new_rgrav_begin = val_begin
-
-			if
-				node_pos_end[1] == snip_pos_begin[1]
-				and node_pos_end[2] == snip_pos_begin[2]
-			then
-				new_rgrav_end = val_begin
-				-- both marks of this node were on the beginning of the snippet
-				-- so this has to be checked again for the next node.
-				node_on_begin_mark = true
-				node_indx = node_indx + 1
-			end
-		end
-		node:set_mark_rgrav(new_rgrav_begin, new_rgrav_end)
-	end
-
-	-- the first node starts at begin-mark.
-	local node_on_end_mark = true
-
-	node_indx = #self.nodes
-	while node_on_end_mark do
-		local node = self.nodes[node_indx]
-		if not node then
-			break
-		end
-		local node_pos_begin, node_pos_end = node.mark:pos_begin_end_raw()
-		-- will be set later if the next node has to be updated as well.
-		node_on_end_mark = false
-		-- use false, false as default, this is what most nodes will be set to.
-		local new_rgrav_begin, new_rgrav_end =
-			node.mark.opts.right_gravity, node.mark.opts.end_right_gravity
-		if
-			node_pos_end[1] == snip_pos_end[1]
-			and node_pos_end[2] == snip_pos_end[2]
-		then
-			new_rgrav_end = val_end
-
-			if
-				node_pos_begin[1] == snip_pos_end[1]
-				and node_pos_begin[2] == snip_pos_end[2]
-			then
-				new_rgrav_begin = val_end
-				-- both marks of this node were on the end-mark of the snippet
-				-- so this has to be checked again for the next node.
-				node_on_end_mark = true
-				node_indx = node_indx - 1
-			end
-		end
-		node:set_mark_rgrav(new_rgrav_begin, new_rgrav_end)
-	end
 end
 
 function Snippet:text_only()
@@ -1018,8 +1177,9 @@ end
 
 function Snippet:event(event, event_args)
 	local callback = self.callbacks[-1][event]
+	local cb_res
 	if callback then
-		callback(self, event_args)
+		cb_res = callback(self, event_args)
 	end
 	if self.type == types.snippetNode and self.pos then
 		-- if snippetNode, also do callback for position in parent.
@@ -1031,7 +1191,12 @@ function Snippet:event(event, event_args)
 
 	session.event_node = self
 	session.event_args = event_args
-	vim.cmd("doautocmd User Luasnip" .. events.to_string(self.type, event))
+	vim.api.nvim_exec_autocmds("User", {
+		pattern = "Luasnip" .. events.to_string(self.type, event),
+		modeline = false,
+	})
+
+	return cb_res
 end
 
 local function nodes_from_pattern(pattern)
@@ -1144,6 +1309,11 @@ function Snippet:update_all_dependents_static()
 end
 
 function Snippet:resolve_position(position)
+	-- only snippets have -1-node.
+	if position == -1 and self.type == types.snippet then
+		return self.prev
+	end
+
 	return self.nodes[position]
 end
 
@@ -1177,6 +1347,203 @@ function Snippet:invalidate()
 	self.invalidated = true
 	snippet_collection.invalidated_count = snippet_collection.invalidated_count
 		+ 1
+end
+
+-- used in add_snippets to get variants of snippet.
+function Snippet:retrieve_all()
+	return { self }
+end
+
+function Snippet:get_keyed_node(key)
+	-- get key-node from dependents_dict.
+	return self.dependents_dict:get({ "key", key, "node" })
+end
+
+-- adjust rgrav of nodes left (direction=-1) or right (direction=1) of node at
+-- child_indx.
+-- (direction is the direction into which is searched, from child_indx outward)
+-- assumption: direction-endpoint of node is on child_endpoint. (caller
+-- responsible)
+function Snippet:set_sibling_rgravs(node, child_endpoint, direction, rgrav)
+	node_util.nodelist_adjust_rgravs(
+		self.nodes,
+		node.absolute_position[#node.absolute_position] + direction,
+		child_endpoint,
+		direction,
+		rgrav,
+		true
+	)
+end
+
+-- called only if the "-direction"-endpoint has to be changed, but the
+-- "direction"-endpoint not.
+function Snippet:subtree_set_pos_rgrav(pos, direction, rgrav)
+	self.mark:set_rgrav(-direction, rgrav)
+
+	local child_from_indx
+	if direction == 1 then
+		child_from_indx = 1
+	else
+		child_from_indx = #self.nodes
+	end
+
+	node_util.nodelist_adjust_rgravs(
+		self.nodes,
+		child_from_indx,
+		pos,
+		direction,
+		rgrav,
+		true
+	)
+end
+-- changes rgrav of all nodes and all endpoints in this snippetNode to `rgrav`.
+function Snippet:subtree_set_rgrav(rgrav)
+	self.mark:set_rgravs(rgrav, rgrav)
+	for _, node in ipairs(self.nodes) do
+		node:subtree_set_rgrav(rgrav)
+	end
+end
+
+-- for this to always return a node if pos is withing the snippet-boundaries,
+-- the snippet must have valid extmarks.
+-- Looks for a node that has a specific property (either linkable, or
+-- interactive), which can be indicated by setting mode to either of the two
+-- (as string).
+function Snippet:node_at(pos, mode)
+	if #self.nodes == 0 then
+		-- special case: no children (can naturally occur with dynamicNode,
+		-- when its function could not be evaluated, or if a user passed an empty snippetNode).
+		return self
+	end
+
+	-- collect nodes where pos is either in gravity-adjusted boundaries, ..
+	local gravity_matches = {}
+	-- .. or just inside the regular boundaries.
+	-- Both are needed, so we can fall back to matches if there is no gravity_match
+	-- with the desired mode ("linkable" or "interactive"), fall back to
+	-- extmark_matches if there is also no regular match with the desired mode,
+	-- and finally fall back to any match (still preferring extmark-match) if
+	-- there is no match with the desired mode at all.
+	-- Unfortunately, all this is necessary, since there are many cases where
+	-- we may return no linkable node, despite there apparently being one in
+	-- reach of the cursor.
+	local matches = {}
+	-- find_node visits all nodes in-order until the predicate returns true.
+	self:find_node(function(node)
+		if not node:leaf() then
+			-- not a leaf-node.
+			return false
+		end
+
+		local node_mark = node.mark
+		local node_from, node_to = node_mark:pos_begin_end_raw()
+		-- if pos certainly beyond node, quickly continue.
+		-- This means a little more work for the nodes in range of pos, while
+		-- all nodes well before it are quickly skipped => should benefit
+		-- all cases where the runtime of this is noticeable, and which are not
+		-- unrealistic (lots of zero-width nodes).
+		if util.pos_cmp(pos, { node_to[1], node_to[2] + 1 }) > 0 then
+			return false
+		end
+
+		-- generate gravity-adjusted endpoints.
+		local grav_adjusted_from = { node_from[1], node_from[2] }
+		local grav_adjusted_to = { node_to[1], node_to[2] }
+		if node_mark:get_rgrav(-1) then
+			grav_adjusted_from[2] = grav_adjusted_from[2] + 1
+		end
+		if node_mark:get_rgrav(1) then
+			grav_adjusted_to[2] = grav_adjusted_to[2] + 1
+		end
+
+		local cmp_pos_to = util.pos_cmp(pos, node_to)
+		local cmp_pos_from = util.pos_cmp(pos, node_from)
+		local cmp_grav_from = util.pos_cmp(pos, grav_adjusted_from)
+		local cmp_grav_to = util.pos_cmp(pos, grav_adjusted_to)
+
+		if cmp_pos_from < 0 then
+			-- abort once the first node is definitely beyond pos.
+			-- (extmark-gravity can't move column to the left).
+			return true
+		end
+
+		-- pos between from,to <=> from <= pos < to is used when choosing which
+		-- extmark to insert text into, so we should adopt it here.
+		if cmp_grav_from >= 0 and cmp_grav_to < 0 then
+			table.insert(gravity_matches, node)
+		end
+		-- matches does not have to respect the extmark-conventions, just catch
+		-- all possible nodes.
+		if cmp_pos_from >= 0 and cmp_pos_to <= 0 then
+			table.insert(matches, node)
+		end
+	end)
+
+	-- instead of stupid nesting ifs, and because we can't use goto since
+	-- non-luajit-users should also be able to run luasnip :(((
+	return (function()
+		for _, node in ipairs(gravity_matches) do
+			if node[mode](node) then
+				return node
+			end
+		end
+		for _, node in ipairs(matches) do
+			if node[mode](node) then
+				return node
+			end
+		end
+		-- no interactive node found, fall back to any match.
+		return gravity_matches[1] or matches[1]
+	end)()
+end
+
+-- return the node the snippet jumps to, or nil if there isn't one.
+function Snippet:next_node()
+	-- self.next is $0, .next is either the surrounding node, or the next
+	-- snippet in the list, .prev is the i(-1) if the self.next.next is the
+	-- next snippet.
+
+	if self.parent_node and self.next.next == self.parent_node then
+		return self.next.next
+	else
+		return (self.next.next and self.next.next.prev)
+	end
+end
+
+function Snippet:extmarks_valid()
+	-- assumption: extmarks are contiguous, and all can be queried via pos_begin_end_raw.
+	local ok, current_from, self_to =
+		pcall(self.mark.pos_begin_end_raw, self.mark)
+	if not ok then
+		return false
+	end
+
+	-- below code does not work correctly if the snippet(Node) does not have any children.
+	if #self.nodes == 0 then
+		return true
+	end
+
+	for _, node in ipairs(self.nodes) do
+		local ok_, node_from, node_to =
+			pcall(node.mark.pos_begin_end_raw, node.mark)
+		-- this snippet is invalid if:
+		-- - we can't get the position of some node
+		-- - the positions aren't contiguous or don't completely fill the parent, or
+		-- - any child of this node violates these rules.
+		if
+			not ok_
+			or util.pos_cmp(current_from, node_from) ~= 0
+			or not node:extmarks_valid()
+		then
+			return false
+		end
+		current_from = node_to
+	end
+	if util.pos_cmp(current_from, self_to) ~= 0 then
+		return false
+	end
+
+	return true
 end
 
 return {

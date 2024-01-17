@@ -7,7 +7,9 @@ local RestoreNode = Node:new()
 local types = require("luasnip.util.types")
 local events = require("luasnip.util.events")
 local util = require("luasnip.util.util")
+local node_util = require("luasnip.nodes.util")
 local mark = require("luasnip.util.mark").mark
+local extend_decorator = require("luasnip.util.extend_decorator")
 
 local function R(pos, key, nodes, opts)
 	-- don't create nested snippetNodes, unnecessary.
@@ -24,8 +26,14 @@ local function R(pos, key, nodes, opts)
 		active = false,
 	}, opts)
 end
+extend_decorator.register(R, { arg_indx = 4 })
 
 function RestoreNode:exit()
+	if not self.visible then
+		-- already exited.
+		return
+	end
+
 	self.visible = false
 	self.mark:clear()
 	-- snip should exist if exit is called.
@@ -37,19 +45,31 @@ function RestoreNode:exit()
 	self.active = false
 end
 
-function RestoreNode:input_enter()
+function RestoreNode:input_enter(_, dry_run)
+	if dry_run then
+		dry_run.active[self] = true
+		return
+	end
+
 	self.active = true
+	self.visited = true
 	self.mark:update_opts(self.ext_opts.active)
 
 	self:event(events.enter)
 end
 
-function RestoreNode:input_leave()
+function RestoreNode:input_leave(_, dry_run)
+	if dry_run then
+		dry_run.active[self] = false
+		return
+	end
+
 	self:event(events.leave)
 
 	self:update_dependents()
 	self.active = false
-	self.mark:update_opts(self.ext_opts.passive)
+
+	self.mark:update_opts(self:get_passive_ext_opts())
 end
 
 -- set snippetNode for this key here.
@@ -109,35 +129,41 @@ function RestoreNode:put_initial(pos)
 	local mark_opts = vim.tbl_extend("keep", {
 		right_gravity = false,
 		end_right_gravity = false,
-	}, tmp.ext_opts.passive)
+	}, tmp:get_passive_ext_opts())
 
 	local old_pos = vim.deepcopy(pos)
 	tmp:put_initial(pos)
 	tmp.mark = mark(old_pos, pos, mark_opts)
 
-	-- no need to call update here, will be done by function calling put_initial.
+	-- no need to call update here, will be done by function calling this
+	-- function.
 
 	self.snip = tmp
 	self.visible = true
 end
 
 -- the same as DynamicNode.
-function RestoreNode:jump_into(dir, no_move)
-	if self.active then
-		self:input_leave()
+function RestoreNode:jump_into(dir, no_move, dry_run)
+	self:init_dry_run_active(dry_run)
+
+	if self:is_active(dry_run) then
+		self:input_leave(no_move, dry_run)
+
 		if dir == 1 then
-			return self.next:jump_into(dir, no_move)
+			return self.next:jump_into(dir, no_move, dry_run)
 		else
-			return self.prev:jump_into(dir, no_move)
+			return self.prev:jump_into(dir, no_move, dry_run)
 		end
 	else
-		self:input_enter()
-		return self.snip:jump_into(dir, no_move)
+		self:input_enter(no_move, dry_run)
+
+		return self.snip:jump_into(dir, no_move, dry_run)
 	end
 end
 
 function RestoreNode:set_ext_opts(name)
-	self.mark:update_opts(self.ext_opts[name])
+	Node.set_ext_opts(self, name)
+
 	self.snip:set_ext_opts(name)
 end
 
@@ -146,14 +172,17 @@ function RestoreNode:update()
 end
 
 function RestoreNode:update_static()
-	self.snip:update_static()
+	-- *_static-methods can use the stored snippet, since they don't require
+	-- the snip to actually be inside the restoreNode.
+	self.parent.snippet.stored[self.key]:update_static()
 end
 
 local function snip_init(self, snip)
 	snip.parent = self.parent
 
 	snip.snippet = self.parent.snippet
-	snip.pos = self.pos
+	-- pos should be nil if the restoreNode is inside a choiceNode.
+	snip.pos = rawget(self, "pos")
 
 	snip:resolve_child_ext_opts()
 	snip:resolve_node_ext_opts()
@@ -179,22 +208,17 @@ end
 function RestoreNode:get_static_text()
 	-- cache static_text, no need to recalculate function.
 	if not self.static_text then
-		self.static_text = self.snip:get_static_text()
+		self.static_text =
+			self.parent.snippet.stored[self.key]:get_static_text()
 	end
 	return self.static_text
 end
 
 function RestoreNode:get_docstring()
 	if not self.docstring then
-		self.docstring = self.snip:get_docstring()
+		self.docstring = self.parent.snippet.stored[self.key]:get_docstring()
 	end
 	return self.docstring
-end
-
-function RestoreNode:set_mark_rgrav(val_begin, val_end)
-	Node.set_mark_rgrav(self, val_begin, val_end)
-	-- snip is set in put_initial, before calls to that set_mark_rgrav() won't be called.
-	self.snip:set_mark_rgrav(val_begin, val_end)
 end
 
 function RestoreNode:store() end
@@ -225,19 +249,18 @@ end
 
 function RestoreNode:update_all_dependents()
 	self:_update_dependents()
-	self.snip:_update_dependents()
+	self.snip:update_all_dependents()
 end
 
 function RestoreNode:update_all_dependents_static()
 	self:_update_dependents_static()
-	self.snip:_update_dependents_static()
+	self.parent.snippet.stored[self.key]:_update_dependents_static()
 end
 
 function RestoreNode:init_insert_positions(position_so_far)
 	Node.init_insert_positions(self, position_so_far)
-	self.snip_absolute_insert_position = vim.deepcopy(
-		self.absolute_insert_position
-	)
+	self.snip_absolute_insert_position =
+		vim.deepcopy(self.absolute_insert_position)
 	-- nodes of current snippet should have a 0 before.
 	self.snip_absolute_insert_position[#self.snip_absolute_insert_position + 1] =
 		0
@@ -253,6 +276,30 @@ end
 function RestoreNode:resolve_position(position)
 	-- position must be 0, there are no other options.
 	return self.snip
+end
+
+function RestoreNode:is_interactive()
+	-- shouldn't be called, but revisit this once is_interactive is used in
+	-- places other than lsp-snippets.
+	return true
+end
+
+function RestoreNode:subtree_set_pos_rgrav(pos, direction, rgrav)
+	self.mark:set_rgrav(-direction, rgrav)
+	if self.snip then
+		self.snip:subtree_set_pos_rgrav(pos, direction, rgrav)
+	end
+end
+
+function RestoreNode:subtree_set_rgrav(rgrav)
+	self.mark:set_rgravs(rgrav, rgrav)
+	if self.snip then
+		self.snip:subtree_set_rgrav(rgrav)
+	end
+end
+
+function RestoreNode:extmarks_valid()
+	return node_util.generic_extmarks_valid(self, self.snip)
 end
 
 return {

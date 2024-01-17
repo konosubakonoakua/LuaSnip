@@ -14,6 +14,10 @@ local sep = (function()
 	return package.config:sub(1, 1)
 end)()
 
+local root_pattern = (function()
+	return uv.os_uname().sysname:find("Windows") and "%w%:" or "%/"
+end)()
+
 function Path.join(...)
 	return table.concat({ ... }, sep)
 end
@@ -51,24 +55,71 @@ function Path.read_file(path)
 	return buf
 end
 
-local MYCONFIG_ROOT = vim.env.MYVIMRC
--- if MYVIMRC is not set then it means nvim was called with -u
--- therefore the first script is the configuration
--- in case of calling -u NONE the plugin won't be loaded so we don't
--- have to handle that
+local MYCONFIG_ROOT
 
-if not MYCONFIG_ROOT then
-	MYCONFIG_ROOT = vim.fn.execute("scriptnames"):match("1: ([^\n]+)")
+if vim.env.MYVIMRC then
+	MYCONFIG_ROOT = vim.fn.fnamemodify(vim.env.MYVIMRC, ":p:h")
+else
+	MYCONFIG_ROOT = vim.fn.getcwd()
 end
--- remove the filename of the script  to optain where is it (most of the time it will be ~/.config/nvim/)
-
-MYCONFIG_ROOT = MYCONFIG_ROOT:gsub(("%s[^%s]+$"):format(sep, sep), "")
 
 function Path.expand(filepath)
 	local expanded = filepath
 		:gsub("^~", vim.env.HOME)
-		:gsub("^[.]", MYCONFIG_ROOT)
+		:gsub("^[.][/\\]", MYCONFIG_ROOT .. sep)
 	return uv.fs_realpath(expanded)
+end
+
+-- do our best at normalizing a non-existing path.
+function Path.normalize_nonexisting(filepath, cwd)
+	cwd = cwd or vim.fn.getcwd()
+
+	local normalized = filepath
+		-- replace multiple slashes by one.
+		:gsub(sep .. sep .. "+", sep)
+		-- remove trailing slash.
+		:gsub(sep .. "$", "")
+		-- remove ./ from path.
+		:gsub("%." .. sep, "")
+
+	-- if not yet absolute, prepend path to current directory.
+	if not normalized:match("^" .. root_pattern .. "") then
+		normalized = Path.join(cwd, normalized)
+	end
+
+	return normalized
+end
+
+function Path.expand_nonexisting(filepath, cwd)
+	filepath
+		-- replace ~ with home-directory.
+		:gsub("^~", vim.env.HOME)
+		-- replace ./ or .\ with config-directory (likely ~/.config/nvim)
+		:gsub(
+			"^[.][/\\]",
+			MYCONFIG_ROOT .. sep
+		)
+
+	return Path.normalize_nonexisting(filepath, cwd)
+end
+
+-- do our best at expanding a path that may or may not exist (ie. check if it
+-- exists, if so do regular expand, and guess expanded path otherwise)
+-- Not the clearest name :/
+function Path.expand_maybe_nonexisting(filepath, cwd)
+	local real_expanded = Path.expand(filepath)
+	if not real_expanded then
+		real_expanded = Path.expand_nonexisting(filepath, cwd)
+	end
+	return real_expanded
+end
+
+function Path.normalize_maybe_nonexisting(filepath, cwd)
+	local real_normalized = Path.normalize(filepath)
+	if not real_normalized then
+		real_normalized = Path.normalize_nonexisting(filepath, cwd)
+	end
+	return real_normalized
 end
 
 ---Return files and directories in path as a list
@@ -82,6 +133,14 @@ function Path.scandir(root)
 		while name do
 			name, type = uv.fs_scandir_next(fs)
 			local path = Path.join(root, name)
+			-- On networked filesystems, it can happen that we get
+			-- a name, but no type. In this case, we must query the
+			-- type manually via fs_stat(). See issue:
+			-- https://github.com/luvit/luv/issues/660
+			if name and not type then
+				local stat = uv.fs_stat(path)
+				type = stat and stat.type
+			end
 			if type == "file" then
 				table.insert(files, path)
 			elseif type == "directory" then
@@ -120,5 +179,25 @@ function Path.basename(filepath, ext)
 		return base
 	end
 end
+
+function Path.extension(fname)
+	return fname:match("%.([^%.]+)$")
+end
+
+function Path.components(path)
+	return vim.split(path, sep, { plain = true, trimempty = true })
+end
+
+function Path.parent(path)
+	local last_component = path:match("%" .. sep .. "[^" .. sep .. "]+$")
+	if not last_component then
+		return nil
+	end
+
+	return path:sub(1, #path - #last_component)
+end
+
+-- returns nil if the file does not exist!
+Path.normalize = uv.fs_realpath
 
 return Path

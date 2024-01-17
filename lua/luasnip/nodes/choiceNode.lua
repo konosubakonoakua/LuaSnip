@@ -7,6 +7,7 @@ local events = require("luasnip.util.events")
 local mark = require("luasnip.util.mark").mark
 local session = require("luasnip.session")
 local sNode = require("luasnip.nodes.snippet").SN
+local extend_decorator = require("luasnip.util.extend_decorator")
 
 function ChoiceNode:init_nodes()
 	for i, choice in ipairs(self.choices) do
@@ -73,6 +74,7 @@ local function C(pos, choices, opts)
 	c:init_nodes()
 	return c
 end
+extend_decorator.register(C, { arg_indx = 3 })
 
 function ChoiceNode:subsnip_init()
 	node_util.subsnip_init_children(self.parent, self.choices)
@@ -112,7 +114,7 @@ function ChoiceNode:put_initial(pos)
 	local mark_opts = vim.tbl_extend("keep", {
 		right_gravity = false,
 		end_right_gravity = false,
-	}, self.active_choice.ext_opts.passive)
+	}, self.active_choice:get_passive_ext_opts())
 
 	self.active_choice.mark = mark(old_pos, pos, mark_opts)
 	self.visible = true
@@ -130,23 +132,36 @@ function ChoiceNode:expand_tabs(tabwidth, indentstringlen)
 	end
 end
 
-function ChoiceNode:input_enter()
-	self.mark:update_opts(self.ext_opts.active)
-	self.parent:enter_node(self.indx)
+function ChoiceNode:input_enter(_, dry_run)
+	if dry_run then
+		dry_run.active[self] = true
+		return
+	end
 
-	self.prev_choice_node = session.active_choice_node
-	session.active_choice_node = self
+	self.mark:update_opts(self.ext_opts.active)
+	self:focus()
+
+	self.prev_choice_node =
+		session.active_choice_nodes[vim.api.nvim_get_current_buf()]
+	session.active_choice_nodes[vim.api.nvim_get_current_buf()] = self
+	self.visited = true
 	self.active = true
 
 	self:event(events.enter)
 end
 
-function ChoiceNode:input_leave()
+function ChoiceNode:input_leave(_, dry_run)
+	if dry_run then
+		dry_run.active[self] = false
+		return
+	end
+
 	self:event(events.leave)
 
-	self.mark:update_opts(self.ext_opts.passive)
+	self.mark:update_opts(self:get_passive_ext_opts())
 	self:update_dependents()
-	session.active_choice_node = self.prev_choice_node
+	session.active_choice_nodes[vim.api.nvim_get_current_buf()] =
+		self.prev_choice_node
 	self.active = false
 end
 
@@ -166,22 +181,32 @@ function ChoiceNode:get_docstring()
 	)
 end
 
-function ChoiceNode:jump_into(dir, no_move)
-	if self.active then
-		self:input_leave()
+function ChoiceNode:jump_into(dir, no_move, dry_run)
+	self:init_dry_run_active(dry_run)
+
+	if self:is_active(dry_run) then
+		self:input_leave(no_move, dry_run)
+
 		if dir == 1 then
-			return self.next:jump_into(dir, no_move)
+			return self.next:jump_into(dir, no_move, dry_run)
 		else
-			return self.prev:jump_into(dir, no_move)
+			return self.prev:jump_into(dir, no_move, dry_run)
 		end
 	else
-		self:input_enter()
-		return self.active_choice:jump_into(dir, no_move)
+		self:input_enter(no_move, dry_run)
+
+		return self.active_choice:jump_into(dir, no_move, dry_run)
 	end
 end
 
 function ChoiceNode:update()
 	self.active_choice:update()
+end
+
+function ChoiceNode:update_static_all()
+	for _, choice in ipairs(self.choices) do
+		choice:update_static()
+	end
 end
 
 function ChoiceNode:update_static()
@@ -216,10 +241,8 @@ function ChoiceNode:set_choice(choice, current_node)
 
 	local insert_pre_cc = vim.fn.mode() == "i"
 	-- is byte-indexed! Doesn't matter here, but important to be aware of.
-	local cursor_pos_pre_relative = util.pos_sub(
-		util.get_cursor_0ind(),
-		current_node.mark:pos_begin_raw()
-	)
+	local cursor_pos_pre_relative =
+		util.pos_sub(util.get_cursor_0ind(), current_node.mark:pos_begin_raw())
 
 	self.active_choice:store()
 
@@ -233,23 +256,34 @@ function ChoiceNode:set_choice(choice, current_node)
 	--
 	-- active_choice has to be disabled (nilled?) to prevent reading from
 	-- cleared mark in set_mark_rgrav (which will be called in
-	-- parent:set_text(self,...) a few lines below).
+	-- self:set_text({""}) a few lines below).
 	self.active_choice = nil
-	self.parent:set_text(self, { "" })
+	self:set_text({ "" })
 
 	self.active_choice = choice
 
 	self.active_choice.mark = self.mark:copy_pos_gravs(
-		vim.deepcopy(self.active_choice.ext_opts.passive)
+		vim.deepcopy(self.active_choice:get_passive_ext_opts())
 	)
+
+	-- re-init positions for child-restoreNodes (they will update their
+	-- children in put_initial, but their own position has to be changed here).
+	self:init_positions(self.absolute_position)
+	self:init_insert_positions(self.absolute_insert_position)
+
+	-- self is still focused, from `set_text`.
 	self.active_choice:put_initial(self.mark:pos_begin_raw())
+	-- adjust gravity in left side of inserted node, such that it matches the
+	-- current gravity of self.
+	local _, to = self.mark:pos_begin_end_raw()
+	self.active_choice:subtree_set_pos_rgrav(to, -1, true)
 
 	self.active_choice:update_restore()
 	self.active_choice:update_all_dependents()
 	self:update_dependents()
 
 	-- Another node may have been entered in update_dependents.
-	self.parent:enter_node(self.indx)
+	self:focus()
 	self:event(events.change_choice)
 
 	if self.restore_cursor then
@@ -304,25 +338,20 @@ end
 
 function ChoiceNode:exit()
 	self.visible = false
-	self.active_choice:exit()
+	if self.active_choice then
+		self.active_choice:exit()
+	end
 	self.mark:clear()
 	if self.active then
-		session.active_choice_node = self.prev_choice_node
+		session.active_choice_nodes[vim.api.nvim_get_current_buf()] =
+			self.prev_choice_node
 	end
 	self.active = false
 end
 
--- val_begin/end may be nil, in this case that gravity won't be changed.
-function ChoiceNode:set_mark_rgrav(rgrav_beg, rgrav_end)
-	Node.set_mark_rgrav(self, rgrav_beg, rgrav_end)
-	-- may be set to temporarily in change_choice.
-	if self.active_choice then
-		self.active_choice:set_mark_rgrav(rgrav_beg, rgrav_end)
-	end
-end
-
 function ChoiceNode:set_ext_opts(name)
-	self.mark:update_opts(self.ext_opts[name])
+	Node.set_ext_opts(self, name)
+
 	self.active_choice:set_ext_opts(name)
 end
 
@@ -373,6 +402,24 @@ end
 function ChoiceNode:static_init()
 	Node.static_init(self)
 	self.active_choice:static_init()
+end
+
+function ChoiceNode:subtree_set_pos_rgrav(pos, direction, rgrav)
+	self.mark:set_rgrav(-direction, rgrav)
+	if self.active_choice then
+		self.active_choice:subtree_set_pos_rgrav(pos, direction, rgrav)
+	end
+end
+
+function ChoiceNode:subtree_set_rgrav(rgrav)
+	self.mark:set_rgravs(rgrav, rgrav)
+	if self.active_choice then
+		self.active_choice:subtree_set_rgrav(rgrav)
+	end
+end
+
+function ChoiceNode:extmarks_valid()
+	return node_util.generic_extmarks_valid(self, self.active_choice)
 end
 
 return {
